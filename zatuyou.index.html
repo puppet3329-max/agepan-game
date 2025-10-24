@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>揚げパンキャッチ - 最新版</title>
+<style>
+body, html {
+  margin:0; padding:0; height:100%; background:#f6f3ea;
+  font-family:sans-serif; display:flex; flex-direction:column; align-items:center; justify-content:flex-start;
+  overflow:hidden;
+}
+h1 { margin-top:10px; font-size:20px; color:#5a4a3a; }
+#gameCanvas {
+  background:#fff; border:2px solid #ccc; border-radius:8px;
+  margin-top:8px; touch-action:none; cursor:pointer;
+  display:block;
+}
+#hud {
+  position:absolute;
+  top:10px; right:20px;
+  font-weight:bold; font-size:1.3em; color:#d9534f;
+  background:rgba(255,255,255,0.7); padding:6px 12px; border-radius:10px;
+}
+input, button {
+  padding:6px 10px; margin:4px; border-radius:6px; border:1px solid #ccc; font-size:14px;
+}
+#startBtn { background:#5cb85c; color:white; border-color:#4cae4c; font-weight:bold; }
+#rankingModal {
+  position:fixed; top:0; left:0; right:0; bottom:0;
+  background:rgba(0,0,0,0.5);
+  display:none; justify-content:center; align-items:center;
+}
+#rankingBox {
+  background:white; padding:20px; border-radius:12px; width:300px; max-height:80vh; overflow-y:auto;
+  box-shadow:0 4px 10px rgba(0,0,0,0.3); text-align:left;
+}
+#rankingBox h2 { margin-top:0; text-align:center; }
+</style>
+</head>
+<body>
+<h1>🍞 揚げパンキャッチ 🍞</h1>
+<div>
+<input id="name" type="text" maxlength="12" placeholder="ニックネーム">
+<button id="saveName">保存</button>
+<button id="startBtn">スタート</button>
+</div>
+
+<div id="hud">スコア: <span id="score">0</span></div>
+<canvas id="gameCanvas" width="720" height="1280"></canvas>
+<div id="status" style="margin-top:4px;color:#666;font-size:13px">準備OK</div>
+
+<!-- 🏆 ランキング -->
+<div id="rankingModal">
+  <div id="rankingBox">
+    <h2>🏆 ランキング TOP50</h2>
+    <div id="topList">読み込み中...</div>
+    <button onclick="closeRanking()">閉じる</button>
+  </div>
+</div>
+
+<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-firestore-compat.js"></script>
+
+<script>
+// --- Firebase設定 ---
+const firebaseConfig = {
+  apiKey: "AIzaSyDEw8toQjptCxMNLD2ocugFFNdRRm1Leu",
+  authDomain: "agepan-game-ranking.firebaseapp.com",
+  projectId: "agepan-game-ranking",
+  storageBucket: "agepan-game-ranking.firebasestorage.app",
+  messagingSenderId: "123624437733",
+  appId: "1:123624437733:web:c556e94a2d5699b7963f0c",
+};
+firebase.initializeApp(firebaseConfig);
+const db = firebase.firestore();
+
+// --- 効果音 ---
+const catchSound = new Audio("https://actions.google.com/sounds/v1/cartoon/wood_plank_flicks.ogg");
+catchSound.volume = 0.4;
+
+// --- 揚げパン画像（新しい3枚） ---
+const BREAD_IMAGE_URLS = [
+  'https://i.imgur.com/IbgJY53.png',
+  'https://i.imgur.com/dgfhLnz.png',
+  'https://i.imgur.com/Y9QLDGz.png'
+];
+const breadImages = [];
+let imagesLoaded = 0;
+BREAD_IMAGE_URLS.forEach(url => {
+  const img = new Image();
+  img.src = url;
+  img.onload = ()=>{ imagesLoaded++; };
+  breadImages.push(img);
+});
+
+// --- ゲーム設定 ---
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+let W = canvas.width, H = canvas.height;
+const player = { x: W/2, y: H-80, w:160, h:25, speed:10 };
+
+class Bread {
+  constructor(x, y, speed, img) {
+    this.x = x; this.y = y; this.speed = speed; this.img = img;
+    this.w = 100; this.h = 40;
+  }
+  update(dt){ this.y += this.speed * dt; }
+  draw(ctx){ ctx.drawImage(this.img, this.x - this.w/2, this.y - this.h/2, this.w, this.h); }
+  isOut(){ return this.y - this.h/2 > H; }
+}
+
+let breads = [], lastSpawn = 0, score = 0, running = false;
+const BASE_GAME_SPEED = 5;
+const BASE_SPAWN_INTERVAL = 1500; // 初期1.5秒
+let gameSpeed = BASE_GAME_SPEED, spawnInterval = BASE_SPAWN_INTERVAL;
+
+// --- 名前保存 ---
+const nameInput=document.getElementById('name');
+const saveNameBtn=document.getElementById('saveName');
+const status=document.getElementById('status');
+saveNameBtn.onclick=()=>{
+  const n=nameInput.value.trim();
+  if(!n)return;
+  localStorage.setItem('fp_name',n);
+  nameInput.disabled=true;
+  saveNameBtn.disabled=true;
+  status.textContent="名前保存: "+n;
+};
+const saved=localStorage.getItem('fp_name');
+if(saved){
+  nameInput.value=saved;
+  nameInput.disabled=true;
+  saveNameBtn.disabled=true;
+  status.textContent='保存済み: '+saved;
+}
+
+// --- 操作 ---
+const keys={};
+window.addEventListener('keydown',e=>keys[e.key]=true);
+window.addEventListener('keyup',e=>keys[e.key]=false);
+let isPointerDown=false;
+function updatePointer(x){
+  const rect=canvas.getBoundingClientRect();
+  const px=(x-rect.left)*(W/rect.width);
+  player.x=Math.max(player.w/2,Math.min(W-player.w/2,px));
+}
+canvas.addEventListener('touchstart', e=>{isPointerDown=true;updatePointer(e.touches[0].clientX);});
+canvas.addEventListener('touchmove', e=>{if(isPointerDown){updatePointer(e.touches[0].clientX);e.preventDefault();}}, {passive:false});
+canvas.addEventListener('touchend', ()=>isPointerDown=false);
+canvas.addEventListener('mousedown', e=>{isPointerDown=true;updatePointer(e.clientX);});
+canvas.addEventListener('mousemove', e=>{if(isPointerDown)updatePointer(e.clientX);});
+canvas.addEventListener('mouseup', ()=>isPointerDown=false);
+
+// --- ゲーム処理（難易度カーブ修正版） ---
+function spawnBread(){
+  if(breadImages.length===0) return;
+  const x = Math.random()*(W-40)+20;
+  const img = breadImages[Math.floor(Math.random()*breadImages.length)];
+  // スコアに応じて最大5倍速まで上昇
+  const fallSpeed = 0.02 * (1 + (Math.min(score, 100) / 100) * 4); // 最大5倍
+  breads.push(new Bread(x, -30, fallSpeed * gameSpeed, img));
+}
+
+function update(dt){
+  if(!running)return;
+  lastSpawn+=dt;
+
+  // 出現間隔（スコアに応じて短縮）
+  spawnInterval = 1500 - Math.min(score * 14, 1400); // 1.5s → 最短0.1s
+  if(spawnInterval < 100) spawnInterval = 100;
+
+  if(lastSpawn>spawnInterval){spawnBread();lastSpawn=0;}
+  if(keys['ArrowLeft']||keys['a'])player.x-=player.speed*1.5;
+  if(keys['ArrowRight']||keys['d'])player.x+=player.speed*1.5;
+  player.x=Math.max(player.w/2,Math.min(W-player.w/2,player.x));
+
+  for(let i=breads.length-1;i>=0;i--){
+    const b=breads[i];b.update(dt);
+    if(b.y+b.h/2>=player.y-player.h/2&&Math.abs(b.x-player.x)<(b.w/2+player.w/2-10)){
+      breads.splice(i,1);
+      score++;
+      document.getElementById('score').textContent=score;
+      catchSound.currentTime=0;
+      catchSound.play();
+      continue;
+    }
+    if(b.isOut()){endGame();return;}
+  }
+}
+
+function draw(){
+  ctx.clearRect(0,0,W,H);
+  ctx.fillStyle='#fff7ec';ctx.fillRect(0,0,W,H);
+  ctx.fillStyle='#C0C0C0';
+  ctx.fillRect(player.x-player.w/2,player.y-player.h/2,player.w,player.h);
+  breads.forEach(b=>b.draw(ctx));
+}
+let lastTime=performance.now();
+function loop(now){const dt=now-lastTime;lastTime=now;update(dt);draw();requestAnimationFrame(loop);}
+requestAnimationFrame(loop);
+
+function startGame(){
+  if(!localStorage.getItem('fp_name')){alert("まず名前を保存してください");return;}
+  breads=[];lastSpawn=0;score=0;gameSpeed=BASE_GAME_SPEED;spawnInterval=BASE_SPAWN_INTERVAL;
+  running=true;
+  document.getElementById('score').textContent="0";
+  status.textContent="プレイ中...";
+}
+
+function endGame(){
+  running=false;
+  status.textContent=`ゲームオーバー！ あなたのスコア: ${score}`;
+  submitScore(localStorage.getItem('fp_name'),score);
+  setTimeout(()=>{ openRanking(); }, 2000);
+}
+
+document.getElementById('startBtn').onclick=startGame;
+
+// --- Firebase & ランキング ---
+async function submitScore(name,scoreVal){
+  if(scoreVal===0)return;
+  try{await db.collection('scores').add({name,score:scoreVal,timestamp:Date.now()});}
+  catch(e){console.error(e);}
+}
+const topList=document.getElementById('topList');
+db.collection('scores').orderBy('score','desc').limit(50)
+  .onSnapshot(snapshot=>{
+    let html='';let rank=1;
+    snapshot.forEach(doc=>{
+      const d=doc.data();
+      html+=`<b>${rank}.</b> ${escapeHTML(d.name)}: ${d.score}<br>`;
+      rank++;
+    });
+    if(snapshot.empty)html='まだスコアがありません';
+    topList.innerHTML=html;
+  });
+function escapeHTML(str){return str.replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));}
+
+function openRanking(){document.getElementById('rankingModal').style.display='flex';}
+function closeRanking(){document.getElementById('rankingModal').style.display='none';}
+
+// --- 自動リサイズ ---
+function resizeCanvas(){
+  const scale=Math.min(window.innerWidth/canvas.width,(window.innerHeight-100)/canvas.height);
+  canvas.style.width=canvas.width*scale+"px";
+  canvas.style.height=canvas.height*scale+"px";
+}
+window.addEventListener('resize',resizeCanvas);
+resizeCanvas();
+</script>
+</body>
+</html>
